@@ -231,19 +231,36 @@ def upload_template():
     if not check_admin():
         return jsonify({'error': 'Forbidden'}), 403
 
-    if 'file' not in request.files:
-        return jsonify({'ok': False, 'error': 'No file provided'}), 400
-
-    f = request.files['file']
-    rel_path = request.form.get('rel_path', '').strip().replace('\\', '/')
+    # Accept JSON body with base64-encoded file data
+    data = request.get_json(silent=True) or {}
+    rel_path = str(data.get('path', '') or data.get('rel_path', '')).strip().replace('\\', '/')
+    b64_data = data.get('data', '')
 
     if not rel_path:
-        return jsonify({'ok': False, 'error': 'rel_path is required'}), 400
+        return jsonify({'ok': False, 'error': 'path is required'}), 400
 
-    if not f.filename.lower().endswith('.dxf'):
-        return jsonify({'ok': False, 'error': 'Only .dxf files are allowed'}), 400
+    if not b64_data:
+        return jsonify({'ok': False, 'error': 'data (base64) is required'}), 400
 
-    file_data = f.read()
+    # Decode base64 file content
+    try:
+        file_data = base64.b64decode(b64_data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Invalid base64 data: {e}'}), 400
+
+    # Normalize path: ensure it starts with "templates/" (lowercase)
+    parts = rel_path.replace('\\', '/').split('/')
+    templates_idx = None
+    for i, part in enumerate(parts):
+        if part.lower() == 'templates':
+            templates_idx = i
+    if templates_idx is not None:
+        rel_parts = parts[templates_idx:]
+        rel_parts[0] = 'templates'
+        rel_path = '/'.join(rel_parts)
+    else:
+        rel_path = 'templates/' + rel_path
+
     filename = os.path.basename(rel_path)
     ts = now_iso()
 
