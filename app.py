@@ -177,6 +177,16 @@ def resolve_template_ids(conn, values):
                 'SELECT id FROM templates WHERE rel_path = ? OR filename = ?',
                 (value, os.path.basename(value))
             ).fetchone()
+        if not row and not value.startswith('templates/'):
+            row = conn.execute(
+                'SELECT id FROM templates WHERE rel_path = ?',
+                ('templates/' + value.replace('\\', '/'),)
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                'SELECT id FROM templates WHERE rel_path LIKE ?',
+                ('%' + value.replace('\\', '/').split('/')[-1],)
+            ).fetchone()
         template_id = str(row['id']) if row else value
         if template_id not in resolved:
             resolved.append(template_id)
@@ -456,6 +466,42 @@ def download_template(template_id):
     )
 
 
+@app.route('/api/templates/download', methods=['GET'])
+def download_template_by_path():
+    rel_path = request.args.get('path', '').strip().replace('\\', '/')
+
+    if not rel_path:
+        return jsonify({'error': 'path is required'}), 400
+
+    with get_db() as conn:
+        tmpl = conn.execute(
+            'SELECT filename, file_data FROM templates WHERE rel_path = ?',
+            (rel_path,)
+        ).fetchone()
+
+        if not tmpl and not rel_path.startswith('templates/'):
+            tmpl = conn.execute(
+                'SELECT filename, file_data FROM templates WHERE rel_path = ?',
+                ('templates/' + rel_path,)
+            ).fetchone()
+
+        if not tmpl:
+            tmpl = conn.execute(
+                'SELECT filename, file_data FROM templates WHERE rel_path LIKE ?',
+                ('%' + rel_path.split('/')[-1],)
+            ).fetchone()
+
+        if not tmpl:
+            return jsonify({'error': 'Template not found'}), 404
+
+    return send_file(
+        io.BytesIO(tmpl['file_data']),
+        mimetype='application/octet-stream',
+        as_attachment=True,
+        download_name=tmpl['filename']
+    )
+
+
 # ──────────────────────────────────────────────
 #  PURCHASES — CLIENT: SUBMIT PAYMENT
 # ──────────────────────────────────────────────
@@ -580,9 +626,12 @@ def list_purchases():
             'templateId':  r['template_id'],
             'relPath':     r['rel_path'],
             'filename':    r['filename'],
+            'templates':   [r['rel_path']],
             'deviceId':    r['device_id'],
+            'clientName':  r['name'],
             'name':        r['name'],
             'phone':       r['phone'],
+            'utr':         r['utr_id'],
             'utrId':       r['utr_id'],
             'amount':      r['amount'],
             'status':      r['status'],
