@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: boys-art-activation
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ADMIN_SECRET
+        value: boysart2024master
