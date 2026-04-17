@@ -8,6 +8,7 @@ import sqlite3
 import json
 import time
 import base64
+import ast
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -18,6 +19,7 @@ CORS(app)
 
 ADMIN_SECRET = os.environ.get('ADMIN_SECRET', 'boysart2024master')
 DB_PATH = os.environ.get('DB_PATH', 'boysart.db')
+PURCHASES_FILE = os.environ.get('PURCHASES_FILE', 'purchases.json')
 
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB max upload
 
@@ -84,6 +86,101 @@ init_db()
 
 def now_iso():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+
+def load_purchases():
+    if not os.path.exists(PURCHASES_FILE):
+        return {}
+    try:
+        with open(PURCHASES_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        clean = {}
+        for device_id, items in data.items():
+            if isinstance(items, list):
+                clean[str(device_id)] = [str(x) for x in items if str(x)]
+        return clean
+    except Exception:
+        return {}
+
+
+def save_purchases(purchases):
+    safe = {}
+    for device_id, items in purchases.items():
+        seen = []
+        for item in items:
+            item = str(item)
+            if item and item not in seen:
+                seen.append(item)
+        safe[str(device_id)] = seen
+    tmp_path = PURCHASES_FILE + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(safe, f, indent=2)
+    os.replace(tmp_path, PURCHASES_FILE)
+
+
+def add_purchase_record(device_id, template_ids):
+    ids = [str(x) for x in template_ids if str(x)]
+    if not ids:
+        return
+    purchases = load_purchases()
+    existing = purchases.get(device_id, [])
+    for template_id in ids:
+        if template_id not in existing:
+            existing.append(template_id)
+    purchases[device_id] = existing
+    save_purchases(purchases)
+
+
+def extract_template_values(data):
+    values = []
+    single = data.get('template_id', data.get('templateId', ''))
+    if single:
+        values.append(single)
+    templates = data.get('templates', [])
+    if not isinstance(templates, list):
+        templates = [templates]
+    for item in templates:
+        value = ''
+        if isinstance(item, dict):
+            value = item.get('id') or item.get('template_id') or item.get('templateId') or item.get('rel_path') or item.get('path') or item.get('filename') or ''
+        else:
+            text = str(item).strip()
+            if text.startswith('{') and text.endswith('}'):
+                try:
+                    parsed = ast.literal_eval(text)
+                    if isinstance(parsed, dict):
+                        value = parsed.get('id') or parsed.get('template_id') or parsed.get('templateId') or parsed.get('rel_path') or parsed.get('path') or parsed.get('filename') or ''
+                    else:
+                        value = text
+                except Exception:
+                    value = text
+            else:
+                value = text
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def resolve_template_ids(conn, values):
+    resolved = []
+    for value in values:
+        value = str(value).strip()
+        if not value:
+            continue
+        row = None
+        if value.isdigit():
+            row = conn.execute('SELECT id FROM templates WHERE id = ?', (int(value),)).fetchone()
+        if not row:
+            row = conn.execute(
+                'SELECT id FROM templates WHERE rel_path = ? OR filename = ?',
+                (value, os.path.basename(value))
+            ).fetchone()
+        template_id = str(row['id']) if row else value
+        if template_id not in resolved:
+            resolved.append(template_id)
+    return resolved
 
 
 def check_admin():
@@ -292,6 +389,10 @@ def upload_template():
 
 @app.route('/api/updates/available', methods=['GET'])
 def updates_available():
+    device_id = (request.args.get('device_id') or request.args.get('deviceId') or 'default_device').strip() or 'default_device'
+    purchases = load_purchases()
+    user_purchased = set(str(x) for x in purchases.get(device_id, []))
+
     with get_db() as conn:
         rows = conn.execute(
             'SELECT id, rel_path, filename, file_size, uploaded_at FROM templates ORDER BY uploaded_at DESC'
@@ -299,10 +400,15 @@ def updates_available():
 
     templates = []
     for r in rows:
+        if str(r['id']) in user_purchased or r['rel_path'] in user_purchased or r['filename'] in user_purchased:
+            continue
         templates.append({
             'id':         r['id'],
+            'template_id': r['id'],
             'rel_path':   r['rel_path'],
+            'path':       r['rel_path'],
             'filename':   r['filename'],
+            'name':       r['filename'],
             'file_size':  r['file_size'],
             'uploaded_at': r['uploaded_at'],
             'price':      5,
@@ -357,39 +463,40 @@ def download_template(template_id):
 @app.route('/api/purchases/submit', methods=['POST'])
 def submit_purchase():
     data = request.get_json(silent=True) or {}
-    template_id = data.get('template_id')
-    device_id   = str(data.get('device_id', '')).strip()
-    name        = str(data.get('name', '')).strip()
+    utr_id      = str(data.get('utr_id') or data.get('utr') or data.get('utrId') or '').strip()
+    device_id   = str(data.get('device_id') or data.get('deviceId') or 'default_device').strip() or 'default_device'
+    name        = str(data.get('name') or data.get('clientName') or '').strip()
     phone       = str(data.get('phone', '')).strip()
-    utr_id      = str(data.get('utr_id', '')).strip()
+    amount      = data.get('amount', 5)
+    template_values = extract_template_values(data)
 
-    if not all([template_id, device_id, name, phone, utr_id]):
-        return jsonify({'ok': False, 'error': 'All fields required: template_id, device_id, name, phone, utr_id'}), 400
+    if not utr_id:
+        return jsonify({'ok': False, 'error': 'UTR / Transaction ID is required'}), 400
 
     with get_db() as conn:
-        tmpl = conn.execute('SELECT id FROM templates WHERE id = ?', (template_id,)).fetchone()
-        if not tmpl:
-            return jsonify({'ok': False, 'error': 'Template not found'}), 404
-
-        existing = conn.execute(
-            'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
-            (template_id, device_id, phone)
-        ).fetchone()
-
-        if existing:
-            if existing['status'] == 'approved':
-                return jsonify({'ok': True, 'status': 'approved', 'id': existing['id']})
-            return jsonify({'ok': True, 'status': existing['status'], 'id': existing['id'],
-                            'message': 'Already submitted. Awaiting admin approval.'})
-
+        template_ids = resolve_template_ids(conn, template_values)
+        if template_ids:
+            add_purchase_record(device_id, template_ids)
         ts = now_iso()
-        cur = conn.execute(
-            '''INSERT INTO purchases (template_id, device_id, name, phone, utr_id, amount, status, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)''',
-            (template_id, device_id, name, phone, utr_id, 5, 'pending', ts, ts)
-        )
+        created_ids = []
+        for template_id in template_ids:
+            if not str(template_id).isdigit():
+                continue
+            existing = conn.execute(
+                'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
+                (int(template_id), device_id, phone)
+            ).fetchone()
+            if existing:
+                created_ids.append(existing['id'])
+                continue
+            cur = conn.execute(
+                '''INSERT INTO purchases (template_id, device_id, name, phone, utr_id, amount, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)''',
+                (int(template_id), device_id, name, phone, utr_id, amount, 'pending', ts, ts)
+            )
+            created_ids.append(cur.lastrowid)
         conn.commit()
-        return jsonify({'ok': True, 'id': cur.lastrowid, 'status': 'pending'})
+        return jsonify({'ok': True, 'id': created_ids[0] if created_ids else None, 'ids': created_ids, 'status': 'pending'})
 
 
 # ──────────────────────────────────────────────
@@ -398,27 +505,46 @@ def submit_purchase():
 
 @app.route('/api/purchases/status', methods=['GET'])
 def purchase_status():
-    template_id = request.args.get('template_id', '').strip()
-    device_id   = request.args.get('device_id', '').strip()
+    template_id = (request.args.get('template_id') or request.args.get('templateId') or '').strip()
+    device_id   = (request.args.get('device_id') or request.args.get('deviceId') or 'default_device').strip() or 'default_device'
     phone       = request.args.get('phone', '').strip()
 
-    if not all([template_id, device_id, phone]):
-        return jsonify({'ok': False, 'error': 'template_id, device_id, phone required'}), 400
-
     with get_db() as conn:
-        row = conn.execute(
-            'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
-            (template_id, device_id, phone)
-        ).fetchone()
+        if template_id:
+            row = conn.execute(
+                'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
+                (template_id, device_id, phone)
+            ).fetchone()
 
-    if not row:
-        return jsonify({'ok': False, 'status': 'not_found'})
+            if not row:
+                return jsonify({'ok': False, 'status': 'not_found'})
 
-    return jsonify({
-        'ok':     True,
-        'id':     row['id'],
-        'status': row['status'],
-    })
+            return jsonify({
+                'ok':     True,
+                'id':     row['id'],
+                'status': row['status'],
+            })
+
+        rows = conn.execute(
+            '''SELECT p.*, t.rel_path, t.filename FROM purchases p
+               JOIN templates t ON t.id = p.template_id
+               WHERE p.device_id = ? AND p.phone = ? AND p.status = "approved"
+               ORDER BY p.updated_at DESC''',
+            (device_id, phone)
+        ).fetchall()
+
+    approved = []
+    for r in rows:
+        approved.append({
+            'id': r['template_id'],
+            'template_id': r['template_id'],
+            'path': r['rel_path'],
+            'rel_path': r['rel_path'],
+            'filename': r['filename'],
+            'name': r['filename'],
+        })
+
+    return jsonify({'ok': True, 'status': 'approved' if approved else 'not_found', 'approvedTemplates': approved})
 
 
 # ──────────────────────────────────────────────
