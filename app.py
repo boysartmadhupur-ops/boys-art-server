@@ -391,11 +391,38 @@ def _cdr_to_dxf(cdr_bytes: bytes) -> str:
     # ── Attempt 3: Binary coordinate extraction ───────────────────────
     else:
         _try_binary(cdr_bytes, paths_mm)
+        paths_mm[:] = _filter_plausible_paths(paths_mm)
 
     if not paths_mm:
         return ''
 
     return _build_dxf(paths_mm)
+
+
+def _filter_plausible_paths(paths_mm: list) -> list:
+    cleaned = []
+    for path in paths_mm:
+        pts = path.get('pts', [])
+        if len(pts) < 6:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if w < 1.0 or h < 1.0 or w > 350.0 or h > 350.0:
+            continue
+        unique = {(round(x, 2), round(y, 2)) for x, y in pts}
+        if len(unique) < 6:
+            continue
+        cleaned.append(path)
+    if len(cleaned) == 1:
+        pts = cleaned[0].get('pts', [])
+        if len(pts) <= 8:
+            xs = sorted({round(p[0], 3) for p in pts})
+            ys = sorted({round(p[1], 3) for p in pts})
+            if len(xs) <= 2 and len(ys) <= 2:
+                return []
+    return cleaned
 
 
 def _try_zip_xml(data: bytes, out: list, pt2mm: float) -> bool:
