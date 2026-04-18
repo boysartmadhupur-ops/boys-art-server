@@ -1,687 +1,680 @@
 """
-Boys Art Activation + Update Server
-Deploy on Render.com for 24/7 worldwide access.
+Boys Art Server — Flask Backend
+Deployed on Render at https://boys-art-server.onrender.com
+
+Endpoints
+---------
+POST /api/activate                  — Client requests activation
+GET  /api/activation/status         — Client checks activation status
+POST /api/submit-purchase           — Client submits template purchase
+GET  /api/templates                 — Client lists available templates
+GET  /api/templates/<path>          — Client downloads a template
+
+GET  /api/admin/submissions         — Master lists activation requests
+POST /api/admin/approve             — Master approves activation
+POST /api/admin/reject              — Master rejects activation
+GET  /api/admin/purchases           — Master lists purchase requests
+POST /api/admin/approve-purchase    — Master approves purchase
+POST /api/admin/reject-purchase     — Master rejects purchase
+POST /api/admin/upload-template     — Master uploads a template
+
+POST /api/convert/cdr               — Convert CDR → DXF (server-side, in-memory)
+GET  /api/health                    — Health check
 """
 
 import os
-import sqlite3
-import json
-import time
-import base64
-import ast
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
 import io
+import re
+import base64
+import json
+import math
+import zipfile
+import sqlite3
+import datetime
+
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
 ADMIN_SECRET = os.environ.get('ADMIN_SECRET', 'boysart2024master')
-DB_PATH = os.environ.get('DB_PATH', 'boysart.db')
-PURCHASES_FILE = os.environ.get('PURCHASES_FILE', 'purchases.json')
+DB_PATH      = os.environ.get('DB_PATH', '/tmp/boysart.db')
 
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB max upload
+ALLOWED_UPLOAD_EXTS = {'.dxf', '.cdr', '.ai', '.plt', '.eps'}
+BLOCKED_UPLOAD_EXTS = {'.pdf'}
 
-
-# ──────────────────────────────────────────────
-#  DATABASE SETUP
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Database helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exc=None):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
 
 
 def init_db():
-    with get_db() as conn:
-        # Existing: activation submissions
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS submissions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT    NOT NULL,
-                phone      TEXT    NOT NULL,
-                utr_id     TEXT    NOT NULL,
-                status     TEXT    NOT NULL DEFAULT "pending",
-                created_at TEXT    NOT NULL,
-                updated_at TEXT    NOT NULL
-            )
-        ''')
-
-        # NEW: DXF templates stored as binary blobs
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS templates (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                rel_path     TEXT    NOT NULL UNIQUE,
-                filename     TEXT    NOT NULL,
-                file_data    BLOB    NOT NULL,
-                file_size    INTEGER NOT NULL,
-                uploaded_at  TEXT    NOT NULL
-            )
-        ''')
-
-        # NEW: Template purchases by clients
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS purchases (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                template_id  INTEGER NOT NULL,
-                device_id    TEXT    NOT NULL,
-                name         TEXT    NOT NULL,
-                phone        TEXT    NOT NULL,
-                utr_id       TEXT    NOT NULL,
-                amount       INTEGER NOT NULL DEFAULT 5,
-                status       TEXT    NOT NULL DEFAULT "pending",
-                created_at   TEXT    NOT NULL,
-                updated_at   TEXT    NOT NULL,
-                FOREIGN KEY (template_id) REFERENCES templates(id)
-            )
-        ''')
-
-        conn.commit()
+    db = sqlite3.connect(DB_PATH)
+    db.execute('''CREATE TABLE IF NOT EXISTS activations (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   TEXT NOT NULL,
+        name        TEXT,
+        phone       TEXT,
+        utr         TEXT,
+        status      TEXT DEFAULT 'pending',
+        created_at  TEXT DEFAULT (datetime('now'))
+    )''')
+    db.execute('''CREATE TABLE IF NOT EXISTS purchases (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   TEXT NOT NULL,
+        client_name TEXT,
+        templates   TEXT,
+        amount      REAL,
+        utr         TEXT,
+        status      TEXT DEFAULT 'pending',
+        created_at  TEXT DEFAULT (datetime('now'))
+    )''')
+    db.execute('''CREATE TABLE IF NOT EXISTS templates (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        path        TEXT UNIQUE NOT NULL,
+        ext         TEXT,
+        data        BLOB NOT NULL,
+        uploaded_at TEXT DEFAULT (datetime('now'))
+    )''')
+    db.commit()
+    db.close()
 
 
-init_db()
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auth helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _require_admin(data):
+    if data.get('secret') != ADMIN_SECRET:
+        return jsonify({'error': 'Forbidden'}), 403
+    return None
 
 
-def now_iso():
-    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+# ─────────────────────────────────────────────────────────────────────────────
+#  Health
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/health')
+def health():
+    return jsonify({'ok': True, 'service': 'Boys Art Server'})
 
 
-def load_purchases():
-    if not os.path.exists(PURCHASES_FILE):
-        return {}
-    try:
-        with open(PURCHASES_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {}
-        clean = {}
-        for device_id, items in data.items():
-            if isinstance(items, list):
-                clean[str(device_id)] = [str(x) for x in items if str(x)]
-        return clean
-    except Exception:
-        return {}
+# ─────────────────────────────────────────────────────────────────────────────
+#  Activation
+# ─────────────────────────────────────────────────────────────────────────────
 
+@app.route('/api/activate', methods=['POST'])
+def activate():
+    data = request.get_json(force=True, silent=True) or {}
+    device_id = data.get('device_id', '').strip()
+    if not device_id:
+        return jsonify({'error': 'device_id required'}), 400
 
-def save_purchases(purchases):
-    safe = {}
-    for device_id, items in purchases.items():
-        seen = []
-        for item in items:
-            item = str(item)
-            if item and item not in seen:
-                seen.append(item)
-        safe[str(device_id)] = seen
-    tmp_path = PURCHASES_FILE + '.tmp'
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(safe, f, indent=2)
-    os.replace(tmp_path, PURCHASES_FILE)
+    db = get_db()
+    existing = db.execute(
+        'SELECT status FROM activations WHERE device_id = ?', (device_id,)
+    ).fetchone()
 
-
-def add_purchase_record(device_id, template_ids):
-    ids = [str(x) for x in template_ids if str(x)]
-    if not ids:
-        return
-    purchases = load_purchases()
-    existing = purchases.get(device_id, [])
-    for template_id in ids:
-        if template_id not in existing:
-            existing.append(template_id)
-    purchases[device_id] = existing
-    save_purchases(purchases)
-
-
-def extract_template_values(data):
-    values = []
-    single = data.get('template_id', data.get('templateId', ''))
-    if single:
-        values.append(single)
-    templates = data.get('templates', [])
-    if not isinstance(templates, list):
-        templates = [templates]
-    for item in templates:
-        value = ''
-        if isinstance(item, dict):
-            value = item.get('id') or item.get('template_id') or item.get('templateId') or item.get('rel_path') or item.get('path') or item.get('filename') or ''
+    if existing:
+        status = existing['status']
+        if status == 'approved':
+            return jsonify({'ok': True, 'status': 'approved'})
+        elif status == 'pending':
+            return jsonify({'ok': True, 'status': 'pending',
+                            'message': 'Your activation is under review.'})
         else:
-            text = str(item).strip()
-            if text.startswith('{') and text.endswith('}'):
-                try:
-                    parsed = ast.literal_eval(text)
-                    if isinstance(parsed, dict):
-                        value = parsed.get('id') or parsed.get('template_id') or parsed.get('templateId') or parsed.get('rel_path') or parsed.get('path') or parsed.get('filename') or ''
-                    else:
-                        value = text
-                except Exception:
-                    value = text
-            else:
-                value = text
-        if value and value not in values:
-            values.append(value)
-    return values
+            return jsonify({'ok': True, 'status': 'rejected',
+                            'message': 'Activation rejected. Contact support.'})
+
+    db.execute(
+        'INSERT INTO activations (device_id, name, phone, utr) VALUES (?, ?, ?, ?)',
+        (device_id,
+         data.get('name', ''),
+         data.get('phone', ''),
+         data.get('utr', ''))
+    )
+    db.commit()
+    return jsonify({'ok': True, 'status': 'pending',
+                    'message': 'Activation request submitted. Awaiting approval.'})
 
 
-def resolve_template_ids(conn, values):
-    resolved = []
-    for value in values:
-        value = str(value).strip()
-        if not value:
-            continue
-        row = None
-        if value.isdigit():
-            row = conn.execute('SELECT id FROM templates WHERE id = ?', (int(value),)).fetchone()
-        if not row:
-            row = conn.execute(
-                'SELECT id FROM templates WHERE rel_path = ? OR filename = ?',
-                (value, os.path.basename(value))
-            ).fetchone()
-        if not row and not value.startswith('templates/'):
-            row = conn.execute(
-                'SELECT id FROM templates WHERE rel_path = ?',
-                ('templates/' + value.replace('\\', '/'),)
-            ).fetchone()
-        if not row:
-            row = conn.execute(
-                'SELECT id FROM templates WHERE rel_path LIKE ?',
-                ('%' + value.replace('\\', '/').split('/')[-1],)
-            ).fetchone()
-        template_id = str(row['id']) if row else value
-        if template_id not in resolved:
-            resolved.append(template_id)
-    return resolved
+@app.route('/api/activation/status')
+def activation_status():
+    device_id = request.args.get('device_id', '').strip()
+    if not device_id:
+        return jsonify({'error': 'device_id required'}), 400
 
-
-def check_admin():
-    secret = request.args.get('secret', '') or (request.get_json(silent=True) or {}).get('secret', '')
-    return secret == ADMIN_SECRET
-
-
-# ──────────────────────────────────────────────
-#  HEALTH CHECK
-# ──────────────────────────────────────────────
-
-@app.route('/api/healthz', methods=['GET'])
-def healthz():
-    return jsonify({'status': 'ok'})
-
-
-# ──────────────────────────────────────────────
-#  ACTIVATION — CLIENT ENDPOINTS (unchanged)
-# ──────────────────────────────────────────────
-
-@app.route('/api/activation/submit', methods=['POST'])
-def submit():
-    data = request.get_json(silent=True) or {}
-    name  = str(data.get('name',  '')).strip()
-    phone = str(data.get('phone', '')).strip()
-    utr   = str(data.get('utrId', '')).strip()
-
-    if not name or not phone or not utr:
-        return jsonify({'ok': False, 'error': 'Please fill all fields: Name, Phone, and UTR.'}), 400
-
-    with get_db() as conn:
-        row = conn.execute(
-            'SELECT * FROM submissions WHERE phone = ?', (phone,)
-        ).fetchone()
-
-        if row:
-            if row['status'] == 'approved':
-                return jsonify({'ok': True, 'status': 'approved', 'message': 'Already approved.', 'name': row['name']})
-            return jsonify({'ok': True, 'status': row['status'], 'message': 'Already submitted. Awaiting approval.'})
-
-        ts = now_iso()
-        cur = conn.execute(
-            'INSERT INTO submissions (name, phone, utr_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?)',
-            (name, phone, utr, 'pending', ts, ts)
-        )
-        conn.commit()
-        return jsonify({'ok': True, 'id': cur.lastrowid, 'status': 'pending'})
-
-
-@app.route('/api/activation/status/<path:phone>', methods=['GET'])
-def check_status(phone):
-    phone = phone.strip()
-    if not phone:
-        return jsonify({'ok': False, 'status': 'not_found', 'error': 'Phone required.'}), 400
-
-    with get_db() as conn:
-        row = conn.execute(
-            'SELECT * FROM submissions WHERE phone = ?', (phone,)
-        ).fetchone()
+    db = get_db()
+    row = db.execute(
+        'SELECT status FROM activations WHERE device_id = ?', (device_id,)
+    ).fetchone()
 
     if not row:
-        return jsonify({'ok': False, 'status': 'not_found'})
-
-    return jsonify({'ok': True, 'status': row['status'], 'name': row['name'], 'phone': row['phone']})
-
-
-# ──────────────────────────────────────────────
-#  ACTIVATION — ADMIN ENDPOINTS (unchanged)
-# ──────────────────────────────────────────────
-
-@app.route('/api/admin/submissions', methods=['GET'])
-def list_submissions():
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
-
-    status_filter = request.args.get('status', '').strip()
-
-    with get_db() as conn:
-        if status_filter in ('pending', 'approved', 'rejected'):
-            rows = conn.execute(
-                'SELECT * FROM submissions WHERE status = ? ORDER BY created_at DESC',
-                (status_filter,)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                'SELECT * FROM submissions ORDER BY created_at DESC'
-            ).fetchall()
-
-    def row_to_dict(row):
-        return {
-            'id':        row['id'],
-            'name':      row['name'],
-            'phone':     row['phone'],
-            'utrId':     row['utr_id'],
-            'status':    row['status'],
-            'createdAt': row['created_at'],
-            'updatedAt': row['updated_at'],
-        }
-
-    return jsonify({'ok': True, 'submissions': [row_to_dict(r) for r in rows]})
+        return jsonify({'status': 'not_found'})
+    return jsonify({'status': row['status']})
 
 
-@app.route('/api/admin/submissions/<int:sub_id>/approve', methods=['POST'])
-def approve(sub_id):
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
+# ─────────────────────────────────────────────────────────────────────────────
+#  Template purchase
+# ─────────────────────────────────────────────────────────────────────────────
 
-    with get_db() as conn:
-        row = conn.execute('SELECT * FROM submissions WHERE id = ?', (sub_id,)).fetchone()
-        if not row:
-            return jsonify({'error': 'Not found'}), 404
-        conn.execute(
-            'UPDATE submissions SET status = ?, updated_at = ? WHERE id = ?',
-            ('approved', now_iso(), sub_id)
-        )
-        conn.commit()
+@app.route('/api/submit-purchase', methods=['POST'])
+def submit_purchase():
+    data      = request.get_json(force=True, silent=True) or {}
+    device_id = data.get('device_id', '').strip()
+    templates = data.get('templates', '')
+    amount    = data.get('amount', 0)
+    utr       = data.get('utr', '').strip()
+    name      = data.get('name', '')
 
-    return jsonify({'ok': True, 'status': 'approved', 'id': sub_id})
+    if not device_id or not utr:
+        return jsonify({'error': 'device_id and utr required'}), 400
 
-
-@app.route('/api/admin/submissions/<int:sub_id>/reject', methods=['POST'])
-def reject(sub_id):
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
-
-    with get_db() as conn:
-        row = conn.execute('SELECT * FROM submissions WHERE id = ?', (sub_id,)).fetchone()
-        if not row:
-            return jsonify({'error': 'Not found'}), 404
-        conn.execute(
-            'UPDATE submissions SET status = ?, updated_at = ? WHERE id = ?',
-            ('rejected', now_iso(), sub_id)
-        )
-        conn.commit()
-
-    return jsonify({'ok': True, 'status': 'rejected', 'id': sub_id})
+    db = get_db()
+    db.execute(
+        'INSERT INTO purchases (device_id, client_name, templates, amount, utr) '
+        'VALUES (?, ?, ?, ?, ?)',
+        (device_id, name, templates, amount, utr)
+    )
+    db.commit()
+    return jsonify({'ok': True, 'message': 'Purchase request submitted.'})
 
 
-# ──────────────────────────────────────────────
-#  TEMPLATES — MASTER UPLOAD
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Template library
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/templates')
+def list_templates():
+    db   = get_db()
+    rows = db.execute('SELECT path, ext, uploaded_at FROM templates ORDER BY path').fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/templates/<path:tmpl_path>')
+def download_template(tmpl_path):
+    db  = get_db()
+    row = db.execute('SELECT data, ext FROM templates WHERE path = ?',
+                     (tmpl_path,)).fetchone()
+    if not row:
+        return jsonify({'error': 'Template not found'}), 404
+
+    b64 = base64.b64encode(row['data']).decode('utf-8')
+    return jsonify({'ok': True, 'path': tmpl_path, 'ext': row['ext'], 'data': b64})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Admin — activations
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/admin/submissions')
+def admin_submissions():
+    data = request.args
+    err  = _require_admin(data)
+    if err:
+        return err
+    db   = get_db()
+    rows = db.execute(
+        'SELECT id, device_id, name, phone, utr, status, created_at '
+        'FROM activations ORDER BY created_at DESC'
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/admin/approve', methods=['POST'])
+def admin_approve():
+    data = request.get_json(force=True, silent=True) or {}
+    err  = _require_admin(data)
+    if err:
+        return err
+    sub_id = data.get('id')
+    if not sub_id:
+        return jsonify({'error': 'id required'}), 400
+    db = get_db()
+    db.execute("UPDATE activations SET status = 'approved' WHERE id = ?", (sub_id,))
+    db.commit()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/reject', methods=['POST'])
+def admin_reject():
+    data = request.get_json(force=True, silent=True) or {}
+    err  = _require_admin(data)
+    if err:
+        return err
+    sub_id = data.get('id')
+    if not sub_id:
+        return jsonify({'error': 'id required'}), 400
+    db = get_db()
+    db.execute("UPDATE activations SET status = 'rejected' WHERE id = ?", (sub_id,))
+    db.commit()
+    return jsonify({'ok': True})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Admin — purchases
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/admin/purchases')
+def admin_purchases():
+    data = request.args
+    err  = _require_admin(data)
+    if err:
+        return err
+    db   = get_db()
+    rows = db.execute(
+        'SELECT id, device_id, client_name, templates, amount, utr, status, created_at '
+        'FROM purchases ORDER BY created_at DESC'
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/admin/approve-purchase', methods=['POST'])
+def admin_approve_purchase():
+    data = request.get_json(force=True, silent=True) or {}
+    err  = _require_admin(data)
+    if err:
+        return err
+    pid = data.get('id')
+    if not pid:
+        return jsonify({'error': 'id required'}), 400
+    db = get_db()
+    db.execute("UPDATE purchases SET status = 'approved' WHERE id = ?", (pid,))
+    db.commit()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/reject-purchase', methods=['POST'])
+def admin_reject_purchase():
+    data = request.get_json(force=True, silent=True) or {}
+    err  = _require_admin(data)
+    if err:
+        return err
+    pid = data.get('id')
+    if not pid:
+        return jsonify({'error': 'id required'}), 400
+    db = get_db()
+    db.execute("UPDATE purchases SET status = 'rejected' WHERE id = ?", (pid,))
+    db.commit()
+    return jsonify({'ok': True})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Admin — template upload (Master → Server)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/admin/upload-template', methods=['POST'])
-def upload_template():
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
+def admin_upload_template():
+    data = request.get_json(force=True, silent=True) or {}
+    err  = _require_admin(data)
+    if err:
+        return err
 
-    # Accept JSON body with base64-encoded file data
-    data = request.get_json(silent=True) or {}
-    rel_path = str(data.get('path', '') or data.get('rel_path', '')).strip().replace('\\', '/')
-    b64_data = data.get('data', '')
+    path_str  = data.get('path', '').strip().replace('\\', '/')
+    b64_data  = data.get('data', '')
 
-    if not rel_path:
-        return jsonify({'ok': False, 'error': 'path is required'}), 400
+    if not path_str or not b64_data:
+        return jsonify({'error': 'path and data required'}), 400
 
-    if not b64_data:
-        return jsonify({'ok': False, 'error': 'data (base64) is required'}), 400
+    ext = os.path.splitext(path_str)[1].lower()
 
-    # Decode base64 file content
+    # ── Block PDF ─────────────────────────────────────────────────────
+    if ext == '.pdf':
+        return jsonify({'error': 'PDF files are not allowed'}), 400
+
+    # ── Validate extension ────────────────────────────────────────────
+    if ext not in ALLOWED_UPLOAD_EXTS:
+        return jsonify({'error': f'Unsupported file type: {ext}'}), 400
+
     try:
-        file_data = base64.b64decode(b64_data)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': f'Invalid base64 data: {e}'}), 400
+        file_bytes = base64.b64decode(b64_data)
+    except Exception:
+        return jsonify({'error': 'Invalid base64 data'}), 400
 
-    # Normalize path: ensure it starts with "templates/" (lowercase)
-    parts = rel_path.replace('\\', '/').split('/')
-    templates_idx = None
-    for i, part in enumerate(parts):
-        if part.lower() == 'templates':
-            templates_idx = i
-    if templates_idx is not None:
-        rel_parts = parts[templates_idx:]
-        rel_parts[0] = 'templates'
-        rel_path = '/'.join(rel_parts)
+    db = get_db()
+    db.execute(
+        'INSERT INTO templates (path, ext, data) VALUES (?, ?, ?) '
+        'ON CONFLICT(path) DO UPDATE SET data=excluded.data, ext=excluded.ext, '
+        'uploaded_at=datetime("now")',
+        (path_str, ext, file_bytes)
+    )
+    db.commit()
+    return jsonify({'ok': True, 'path': path_str, 'ext': ext,
+                    'size': len(file_bytes)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CDR Conversion — in-memory, no disk writes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cdr_to_dxf(cdr_bytes: bytes) -> str:
+    """
+    Convert CDR bytes → DXF string entirely in RAM.
+
+    Strategy (tried in order until paths are found):
+      1. ZIP extraction: CDR X4+ files are ZIP archives with XML content
+         containing SVG-like path data.
+      2. XML pattern scan on raw bytes for coordinates.
+      3. Binary float32 scan as a last-resort fallback that produces a
+         reasonable bounding frame from any geometry found.
+
+    Returns a DXF string (ASCII) ready to be parsed by dxf_parser.parse_dxf.
+    """
+    paths_mm = []   # list of {'pts': [(x,y),...], 'closed': bool}
+
+    PT_TO_MM = 25.4 / 72.0   # PostScript points → mm
+
+    # ── Attempt 1: ZIP + XML (CDR X4 / X5 / X6 / 2019-2023) ─────────
+    if _try_zip_xml(cdr_bytes, paths_mm, PT_TO_MM):
+        pass   # populated
+    # ── Attempt 2: Raw XML scan ───────────────────────────────────────
+    elif _try_raw_xml(cdr_bytes, paths_mm, PT_TO_MM):
+        pass
+    # ── Attempt 3: Binary coordinate extraction ───────────────────────
     else:
-        rel_path = 'templates/' + rel_path
+        _try_binary(cdr_bytes, paths_mm)
 
-    filename = os.path.basename(rel_path)
-    ts = now_iso()
+    if not paths_mm:
+        return ''
 
-    with get_db() as conn:
-        existing = conn.execute(
-            'SELECT id FROM templates WHERE rel_path = ?', (rel_path,)
-        ).fetchone()
+    return _build_dxf(paths_mm)
 
-        if existing:
-            conn.execute(
-                'UPDATE templates SET file_data = ?, file_size = ?, filename = ?, uploaded_at = ? WHERE rel_path = ?',
-                (file_data, len(file_data), filename, ts, rel_path)
+
+def _try_zip_xml(data: bytes, out: list, pt2mm: float) -> bool:
+    """Try to unzip CDR and scan its XML files for path data."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            # Look for content files — preference order
+            content_names = sorted(
+                [n for n in names if n.lower().endswith(('.xml', '.cdr', '.svg'))],
+                key=lambda n: (0 if 'content' in n.lower() else 1)
             )
-            template_id = existing['id']
-            conn.commit()
-            return jsonify({'ok': True, 'id': template_id, 'updated': True, 'rel_path': rel_path})
-        else:
-            cur = conn.execute(
-                'INSERT INTO templates (rel_path, filename, file_data, file_size, uploaded_at) VALUES (?,?,?,?,?)',
-                (rel_path, filename, file_data, len(file_data), ts)
-            )
-            conn.commit()
-            return jsonify({'ok': True, 'id': cur.lastrowid, 'updated': False, 'rel_path': rel_path})
+            for name in content_names:
+                xml_bytes = zf.read(name)
+                try:
+                    xml_str = xml_bytes.decode('utf-8', errors='replace')
+                except Exception:
+                    continue
+                if _parse_svg_paths(xml_str, out, pt2mm):
+                    return True
+                if _parse_cdr_xml_paths(xml_str, out, pt2mm):
+                    return True
+    except zipfile.BadZipFile:
+        pass
+    except Exception as e:
+        print(f'CDR zip error: {e}')
+    return bool(out)
 
 
-# ──────────────────────────────────────────────
-#  TEMPLATES — CLIENT: CHECK FOR UPDATES
-# ──────────────────────────────────────────────
+def _try_raw_xml(data: bytes, out: list, pt2mm: float) -> bool:
+    """Try to decode CDR bytes as text and scan for SVG path data."""
+    try:
+        text = data.decode('utf-8', errors='replace')
+        return _parse_svg_paths(text, out, pt2mm) or _parse_cdr_xml_paths(text, out, pt2mm)
+    except Exception:
+        return False
 
-@app.route('/api/updates/available', methods=['GET'])
-def updates_available():
-    device_id = (request.args.get('device_id') or request.args.get('deviceId') or 'default_device').strip() or 'default_device'
-    purchases = load_purchases()
-    user_purchased = set(str(x) for x in purchases.get(device_id, []))
 
-    with get_db() as conn:
-        rows = conn.execute(
-            'SELECT id, rel_path, filename, file_size, uploaded_at FROM templates ORDER BY uploaded_at DESC'
-        ).fetchall()
+def _parse_svg_paths(text: str, out: list, pt2mm: float) -> bool:
+    """Extract SVG <path d="..."> from XML/SVG content."""
+    found = False
+    for m in re.finditer(r'[dD]\s*=\s*["\']([^"\']{4,})["\']', text):
+        pts, closed = _svg_d_to_pts(m.group(1), pt2mm)
+        if pts:
+            out.append({'pts': pts, 'closed': closed})
+            found = True
+    return found
 
-    templates = []
-    for r in rows:
-        if str(r['id']) in user_purchased or r['rel_path'] in user_purchased or r['filename'] in user_purchased:
+
+def _svg_d_to_pts(d: str, pt2mm: float) -> tuple:
+    """Parse SVG path d attribute into list of mm points."""
+    pts     = []
+    closed  = False
+    cx, cy  = 0.0, 0.0
+    sx, sy  = 0.0, 0.0   # subpath start
+
+    nums_re = re.compile(r'-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
+
+    def _nums(s):
+        return [float(x) for x in nums_re.findall(s)]
+
+    # Split by command letters, keeping the letter
+    parts = re.findall(r'[MmZzLlHhVvCcSsQqTtAa][^MmZzLlHhVvCcSsQqTtAa]*', d)
+    last_ctrl = None
+
+    for part in parts:
+        cmd   = part[0]
+        ns    = _nums(part[1:])
+        rel   = cmd.islower()
+
+        if cmd in ('M', 'm'):
+            for i in range(0, len(ns) - 1, 2):
+                x = (cx + ns[i] if rel and pts else ns[i]) * pt2mm
+                y = (cy + ns[i+1] if rel and pts else ns[i+1]) * pt2mm
+                cx, cy = x / pt2mm, y / pt2mm
+                sx, sy = cx, cy
+                pts.append((x, y))
+            last_ctrl = None
+
+        elif cmd in ('L', 'l'):
+            for i in range(0, len(ns) - 1, 2):
+                x = ((cx + ns[i]) if rel else ns[i]) * pt2mm
+                y = ((cy + ns[i+1]) if rel else ns[i+1]) * pt2mm
+                cx, cy = x / pt2mm, y / pt2mm
+                pts.append((x, y))
+            last_ctrl = None
+
+        elif cmd in ('H', 'h'):
+            for n in ns:
+                x = ((cx + n) if rel else n) * pt2mm
+                cx = x / pt2mm
+                pts.append((x, cy * pt2mm))
+            last_ctrl = None
+
+        elif cmd in ('V', 'v'):
+            for n in ns:
+                y = ((cy + n) if rel else n) * pt2mm
+                cy = y / pt2mm
+                pts.append((cx * pt2mm, y))
+            last_ctrl = None
+
+        elif cmd in ('C', 'c'):
+            for i in range(0, len(ns) - 5, 6):
+                if rel:
+                    x1, y1 = (cx + ns[i])   * pt2mm, (cy + ns[i+1]) * pt2mm
+                    x2, y2 = (cx + ns[i+2]) * pt2mm, (cy + ns[i+3]) * pt2mm
+                    x3, y3 = (cx + ns[i+4]) * pt2mm, (cy + ns[i+5]) * pt2mm
+                else:
+                    x1, y1 = ns[i]*pt2mm, ns[i+1]*pt2mm
+                    x2, y2 = ns[i+2]*pt2mm, ns[i+3]*pt2mm
+                    x3, y3 = ns[i+4]*pt2mm, ns[i+5]*pt2mm
+                bpts = _bez3(pts[-1] if pts else (0,0),
+                              (x1, y1), (x2, y2), (x3, y3))
+                pts.extend(bpts[1:])
+                cx, cy = x3 / pt2mm, y3 / pt2mm
+                last_ctrl = (x2 / pt2mm, y2 / pt2mm)
+
+        elif cmd in ('Q', 'q'):
+            for i in range(0, len(ns) - 3, 4):
+                if rel:
+                    x1, y1 = (cx + ns[i])*pt2mm,   (cy + ns[i+1])*pt2mm
+                    x2, y2 = (cx + ns[i+2])*pt2mm, (cy + ns[i+3])*pt2mm
+                else:
+                    x1, y1 = ns[i]*pt2mm, ns[i+1]*pt2mm
+                    x2, y2 = ns[i+2]*pt2mm, ns[i+3]*pt2mm
+                bpts = _bez2(pts[-1] if pts else (0,0), (x1,y1), (x2,y2))
+                pts.extend(bpts[1:])
+                cx, cy = x2/pt2mm, y2/pt2mm
+                last_ctrl = (x1/pt2mm, y1/pt2mm)
+
+        elif cmd in ('Z', 'z'):
+            if pts:
+                pts.append((sx * pt2mm, sy * pt2mm))
+            closed = True
+
+    return pts, closed
+
+
+def _parse_cdr_xml_paths(text: str, out: list, pt2mm: float) -> bool:
+    """Scan CDR XML for coordinate tags."""
+    found = False
+    # CDR XML stores paths in polyline-like tags with x/y attributes
+    for m in re.finditer(r'<(?:poly|path|shape)[^>]*>', text, re.I):
+        tag = m.group(0)
+        xs  = re.findall(r'[xX]="(-?[\d.]+)"', tag)
+        ys  = re.findall(r'[yY]="(-?[\d.]+)"', tag)
+        if xs and ys and len(xs) == len(ys):
+            try:
+                pts = [(float(x) * pt2mm, float(y) * pt2mm)
+                       for x, y in zip(xs, ys)]
+                if len(pts) >= 2:
+                    out.append({'pts': pts, 'closed': False})
+                    found = True
+            except ValueError:
+                pass
+    return found
+
+
+def _try_binary(data: bytes, out: list) -> bool:
+    """
+    Last-resort: scan binary CDR for float32 coordinate pairs.
+    Looks for runs of plausible (x, y) values in the range typical for
+    mobile skin templates (0–500 mm).
+    """
+    import struct
+    MIN_MM, MAX_MM = -5.0, 600.0
+    pts = []
+    i   = 0
+    while i + 8 <= len(data):
+        try:
+            x = struct.unpack_from('<f', data, i)[0]
+            y = struct.unpack_from('<f', data, i + 4)[0]
+            if MIN_MM <= x <= MAX_MM and MIN_MM <= y <= MAX_MM:
+                pts.append((float(x), float(y)))
+            else:
+                if len(pts) >= 4:
+                    out.append({'pts': pts[:], 'closed': False})
+                pts = []
+        except struct.error:
+            pass
+        i += 4
+    if len(pts) >= 4:
+        out.append({'pts': pts, 'closed': False})
+    return bool(out)
+
+
+def _bez3(p0, p1, p2, p3, steps=24):
+    """Cubic Bezier → point list."""
+    pts = []
+    for i in range(steps + 1):
+        t  = i / steps; mt = 1 - t
+        x  = mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0]
+        y  = mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1]
+        pts.append((x, y))
+    return pts
+
+
+def _bez2(p0, p1, p2, steps=16):
+    """Quadratic Bezier → point list."""
+    pts = []
+    for i in range(steps + 1):
+        t  = i / steps; mt = 1 - t
+        x  = mt**2*p0[0] + 2*mt*t*p1[0] + t**2*p2[0]
+        y  = mt**2*p0[1] + 2*mt*t*p1[1] + t**2*p2[1]
+        pts.append((x, y))
+    return pts
+
+
+def _build_dxf(paths_mm: list) -> str:
+    """Convert list of path dicts to a minimal DXF string."""
+    lines = [
+        '  0', 'SECTION', '  2', 'HEADER',
+        '  9', '$INSUNITS', ' 70', '4',   # 4 = mm
+        '  0', 'ENDSEC',
+        '  0', 'SECTION', '  2', 'ENTITIES',
+    ]
+    for path in paths_mm:
+        pts    = path['pts']
+        closed = path.get('closed', False)
+        if len(pts) < 2:
             continue
-        templates.append({
-            'id':         r['id'],
-            'template_id': r['id'],
-            'rel_path':   r['rel_path'],
-            'path':       r['rel_path'],
-            'filename':   r['filename'],
-            'name':       r['filename'],
-            'file_size':  r['file_size'],
-            'uploaded_at': r['uploaded_at'],
-            'price':      5,
-        })
-
-    return jsonify({'ok': True, 'templates': templates})
+        # Emit as LWPOLYLINE
+        lines += [
+            '  0', 'LWPOLYLINE',
+            '  8', '0',
+            ' 70', '1' if closed else '0',
+            ' 90', str(len(pts)),
+        ]
+        for x, y in pts:
+            lines += [' 10', f'{x:.6f}', ' 20', f'{y:.6f}']
+    lines += ['  0', 'ENDSEC', '  0', 'EOF']
+    return '\n'.join(lines)
 
 
-# ──────────────────────────────────────────────
-#  TEMPLATES — CLIENT: DOWNLOAD (after approval)
-# ──────────────────────────────────────────────
+@app.route('/api/convert/cdr', methods=['POST'])
+def convert_cdr():
+    """
+    POST /api/convert/cdr
+    Body: { "filename": "xxx.cdr", "data": "<base64>" }
+    Returns: { "ok": true, "dxf": "<base64 DXF>" }
+         or: { "ok": false, "error": "..." }
 
-@app.route('/api/templates/download/<int:template_id>', methods=['GET'])
-def download_template(template_id):
-    device_id = request.args.get('device_id', '').strip()
-    phone = request.args.get('phone', '').strip()
+    Security: CDR data is never written to disk.
+    Processing is entirely in RAM.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    b64  = body.get('data', '')
+    if not b64:
+        return jsonify({'ok': False, 'error': 'No data provided'}), 400
 
-    if not device_id or not phone:
-        return jsonify({'error': 'device_id and phone are required'}), 400
+    try:
+        cdr_bytes = base64.b64decode(b64)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid base64 data'}), 400
 
-    with get_db() as conn:
-        # Check purchase is approved for this device+phone combo
-        purchase = conn.execute(
-            '''SELECT p.status FROM purchases p
-               WHERE p.template_id = ? AND p.device_id = ? AND p.phone = ? AND p.status = "approved"
-               LIMIT 1''',
-            (template_id, device_id, phone)
-        ).fetchone()
+    if len(cdr_bytes) < 4:
+        return jsonify({'ok': False, 'error': 'File too small'}), 400
 
-        if not purchase:
-            return jsonify({'error': 'Purchase not approved or not found'}), 403
+    try:
+        dxf_str = _cdr_to_dxf(cdr_bytes)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Conversion error: {e}'}), 500
 
-        tmpl = conn.execute(
-            'SELECT filename, file_data FROM templates WHERE id = ?', (template_id,)
-        ).fetchone()
+    if not dxf_str:
+        return jsonify({'ok': False,
+                        'error': 'No vector geometry found in CDR file. '
+                                 'Only CDR X4 and newer (2008+) are supported.'}), 422
 
-        if not tmpl:
-            return jsonify({'error': 'Template not found'}), 404
-
-    return send_file(
-        io.BytesIO(tmpl['file_data']),
-        mimetype='application/octet-stream',
-        as_attachment=True,
-        download_name=tmpl['filename']
-    )
-
-
-@app.route('/api/templates/download', methods=['GET'])
-def download_template_by_path():
-    rel_path = request.args.get('path', '').strip().replace('\\', '/')
-
-    if not rel_path:
-        return jsonify({'error': 'path is required'}), 400
-
-    with get_db() as conn:
-        tmpl = conn.execute(
-            'SELECT filename, file_data FROM templates WHERE rel_path = ?',
-            (rel_path,)
-        ).fetchone()
-
-        if not tmpl and not rel_path.startswith('templates/'):
-            tmpl = conn.execute(
-                'SELECT filename, file_data FROM templates WHERE rel_path = ?',
-                ('templates/' + rel_path,)
-            ).fetchone()
-
-        if not tmpl:
-            tmpl = conn.execute(
-                'SELECT filename, file_data FROM templates WHERE rel_path LIKE ?',
-                ('%' + rel_path.split('/')[-1],)
-            ).fetchone()
-
-        if not tmpl:
-            return jsonify({'error': 'Template not found'}), 404
-
-    return send_file(
-        io.BytesIO(tmpl['file_data']),
-        mimetype='application/octet-stream',
-        as_attachment=True,
-        download_name=tmpl['filename']
-    )
+    dxf_b64 = base64.b64encode(dxf_str.encode('utf-8')).decode('utf-8')
+    return jsonify({'ok': True, 'dxf': dxf_b64})
 
 
-# ──────────────────────────────────────────────
-#  PURCHASES — CLIENT: SUBMIT PAYMENT
-# ──────────────────────────────────────────────
-
-@app.route('/api/purchases/submit', methods=['POST'])
-def submit_purchase():
-    data = request.get_json(silent=True) or {}
-    utr_id      = str(data.get('utr_id') or data.get('utr') or data.get('utrId') or '').strip()
-    device_id   = str(data.get('device_id') or data.get('deviceId') or 'default_device').strip() or 'default_device'
-    name        = str(data.get('name') or data.get('clientName') or '').strip()
-    phone       = str(data.get('phone', '')).strip()
-    amount      = data.get('amount', 5)
-    template_values = extract_template_values(data)
-
-    if not utr_id:
-        return jsonify({'ok': False, 'error': 'UTR / Transaction ID is required'}), 400
-
-    with get_db() as conn:
-        template_ids = resolve_template_ids(conn, template_values)
-        if template_ids:
-            add_purchase_record(device_id, template_ids)
-        ts = now_iso()
-        created_ids = []
-        for template_id in template_ids:
-            if not str(template_id).isdigit():
-                continue
-            existing = conn.execute(
-                'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
-                (int(template_id), device_id, phone)
-            ).fetchone()
-            if existing:
-                created_ids.append(existing['id'])
-                continue
-            cur = conn.execute(
-                '''INSERT INTO purchases (template_id, device_id, name, phone, utr_id, amount, status, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)''',
-                (int(template_id), device_id, name, phone, utr_id, amount, 'pending', ts, ts)
-            )
-            created_ids.append(cur.lastrowid)
-        conn.commit()
-        return jsonify({'ok': True, 'id': created_ids[0] if created_ids else None, 'ids': created_ids, 'status': 'pending'})
-
-
-# ──────────────────────────────────────────────
-#  PURCHASES — CLIENT: CHECK STATUS
-# ──────────────────────────────────────────────
-
-@app.route('/api/purchases/status', methods=['GET'])
-def purchase_status():
-    template_id = (request.args.get('template_id') or request.args.get('templateId') or '').strip()
-    device_id   = (request.args.get('device_id') or request.args.get('deviceId') or 'default_device').strip() or 'default_device'
-    phone       = request.args.get('phone', '').strip()
-
-    with get_db() as conn:
-        if template_id:
-            row = conn.execute(
-                'SELECT * FROM purchases WHERE template_id = ? AND device_id = ? AND phone = ?',
-                (template_id, device_id, phone)
-            ).fetchone()
-
-            if not row:
-                return jsonify({'ok': False, 'status': 'not_found'})
-
-            return jsonify({
-                'ok':     True,
-                'id':     row['id'],
-                'status': row['status'],
-            })
-
-        rows = conn.execute(
-            '''SELECT p.*, t.rel_path, t.filename FROM purchases p
-               JOIN templates t ON t.id = p.template_id
-               WHERE p.device_id = ? AND p.phone = ? AND p.status = "approved"
-               ORDER BY p.updated_at DESC''',
-            (device_id, phone)
-        ).fetchall()
-
-    approved = []
-    for r in rows:
-        approved.append({
-            'id': r['template_id'],
-            'template_id': r['template_id'],
-            'path': r['rel_path'],
-            'rel_path': r['rel_path'],
-            'filename': r['filename'],
-            'name': r['filename'],
-        })
-
-    return jsonify({'ok': True, 'status': 'approved' if approved else 'not_found', 'approvedTemplates': approved})
-
-
-# ──────────────────────────────────────────────
-#  PURCHASES — ADMIN: LIST & APPROVE/REJECT
-# ──────────────────────────────────────────────
-
-@app.route('/api/admin/purchases', methods=['GET'])
-def list_purchases():
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
-
-    status_filter = request.args.get('status', '').strip()
-
-    with get_db() as conn:
-        if status_filter in ('pending', 'approved', 'rejected'):
-            rows = conn.execute(
-                '''SELECT p.*, t.rel_path, t.filename FROM purchases p
-                   JOIN templates t ON t.id = p.template_id
-                   WHERE p.status = ? ORDER BY p.created_at DESC''',
-                (status_filter,)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                '''SELECT p.*, t.rel_path, t.filename FROM purchases p
-                   JOIN templates t ON t.id = p.template_id
-                   ORDER BY p.created_at DESC'''
-            ).fetchall()
-
-    result = []
-    for r in rows:
-        result.append({
-            'id':          r['id'],
-            'templateId':  r['template_id'],
-            'relPath':     r['rel_path'],
-            'filename':    r['filename'],
-            'templates':   [r['rel_path']],
-            'deviceId':    r['device_id'],
-            'clientName':  r['name'],
-            'name':        r['name'],
-            'phone':       r['phone'],
-            'utr':         r['utr_id'],
-            'utrId':       r['utr_id'],
-            'amount':      r['amount'],
-            'status':      r['status'],
-            'createdAt':   r['created_at'],
-            'updatedAt':   r['updated_at'],
-        })
-
-    return jsonify({'ok': True, 'purchases': result})
-
-
-@app.route('/api/admin/purchases/<int:purchase_id>/approve', methods=['POST'])
-def approve_purchase(purchase_id):
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
-
-    with get_db() as conn:
-        row = conn.execute('SELECT * FROM purchases WHERE id = ?', (purchase_id,)).fetchone()
-        if not row:
-            return jsonify({'error': 'Not found'}), 404
-        conn.execute(
-            'UPDATE purchases SET status = ?, updated_at = ? WHERE id = ?',
-            ('approved', now_iso(), purchase_id)
-        )
-        conn.commit()
-
-    return jsonify({'ok': True, 'status': 'approved', 'id': purchase_id})
-
-
-@app.route('/api/admin/purchases/<int:purchase_id>/reject', methods=['POST'])
-def reject_purchase(purchase_id):
-    if not check_admin():
-        return jsonify({'error': 'Forbidden'}), 403
-
-    with get_db() as conn:
-        row = conn.execute('SELECT * FROM purchases WHERE id = ?', (purchase_id,)).fetchone()
-        if not row:
-            return jsonify({'error': 'Not found'}), 404
-        conn.execute(
-            'UPDATE purchases SET status = ?, updated_at = ? WHERE id = ?',
-            ('rejected', now_iso(), purchase_id)
-        )
-        conn.commit()
-
-    return jsonify({'ok': True, 'status': 'rejected', 'id': purchase_id})
-
-
-# ──────────────────────────────────────────────
-#  RUN
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    init_db()
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
+else:
+    init_db()
