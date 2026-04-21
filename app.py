@@ -349,6 +349,119 @@ def download_template(tmpl_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Client — Check Updates / Purchases (used by update_system.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _owned_template_paths(db, device_id):
+    """All template paths the given device has already paid for and been approved."""
+    owned = set()
+    if not device_id:
+        return owned
+    rows = db.execute(
+        "SELECT templates FROM purchases "
+        "WHERE device_id = ? AND status = 'approved'",
+        (device_id,)
+    ).fetchall()
+    for r in rows:
+        raw = (r['templates'] or '').strip()
+        if not raw:
+            continue
+        for part in raw.replace('\n', ',').split(','):
+            p = part.strip()
+            if p:
+                owned.add(p)
+    return owned
+
+
+@app.route('/api/updates/available')
+def updates_available():
+    device_id = request.args.get('deviceId', '').strip()
+    db = get_db()
+    rows = db.execute(
+        'SELECT path, ext, uploaded_at FROM templates ORDER BY path'
+    ).fetchall()
+    owned = _owned_template_paths(db, device_id)
+    items = []
+    for r in rows:
+        p = r['path']
+        if p in owned:
+            continue
+        items.append({
+            'path': p,
+            'name': p.rsplit('/', 1)[-1],
+            'ext': r['ext'] or '',
+            'uploadedAt': r['uploaded_at'] or '',
+            'price': 5,
+        })
+    return jsonify({'ok': True, 'templates': items, 'count': len(items)})
+
+
+@app.route('/api/purchases/submit', methods=['POST'])
+def purchases_submit():
+    data = request.get_json(force=True, silent=True) or {}
+    device_id = (data.get('deviceId') or data.get('device_id') or '').strip()
+    name      = data.get('clientName') or data.get('name') or ''
+    phone     = data.get('phone', '')
+    templates = data.get('templates', '')
+    amount    = data.get('amount', 0)
+    utr       = (data.get('utr') or '').strip()
+
+    if isinstance(templates, list):
+        templates = ','.join(str(t) for t in templates)
+
+    if not device_id or not utr:
+        return jsonify({'ok': False, 'error': 'deviceId and utr required'}), 400
+
+    db = get_db()
+    # Store phone inside client_name field if no dedicated column? Keep client_name as name.
+    cur = db.execute(
+        'INSERT INTO purchases (device_id, client_name, templates, amount, utr) '
+        'VALUES (?, ?, ?, ?, ?)',
+        (device_id, name, templates, amount, utr)
+    )
+    db.commit()
+    return jsonify({
+        'ok': True,
+        'id': cur.lastrowid,
+        'message': 'Purchase request submitted. Awaiting admin approval.',
+    })
+
+
+@app.route('/api/purchases/status')
+def purchases_status():
+    device_id = request.args.get('deviceId', '').strip()
+    if not device_id:
+        return jsonify({'ok': True, 'approvedTemplates': [], 'pending': 0})
+    db = get_db()
+    approved_paths = sorted(_owned_template_paths(db, device_id))
+    pending = db.execute(
+        "SELECT COUNT(*) AS c FROM purchases "
+        "WHERE device_id = ? AND status = 'pending'",
+        (device_id,)
+    ).fetchone()['c']
+    return jsonify({
+        'ok': True,
+        'approvedTemplates': approved_paths,
+        'pending': pending,
+    })
+
+
+@app.route('/api/templates/download')
+def templates_download_query():
+    """Alias used by client: GET /api/templates/download?path=foo/bar.dxf"""
+    tmpl_path = request.args.get('path', '').strip()
+    if not tmpl_path:
+        return jsonify({'error': 'path required'}), 400
+    db  = get_db()
+    row = db.execute('SELECT data, ext FROM templates WHERE path = ?',
+                     (tmpl_path,)).fetchone()
+    if not row:
+        return jsonify({'error': 'Template not found'}), 404
+    b64 = base64.b64encode(row['data']).decode('utf-8')
+    return jsonify({'ok': True, 'path': tmpl_path, 'ext': row['ext'], 'data': b64})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Admin — activations
 # ─────────────────────────────────────────────────────────────────────────────
 
