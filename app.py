@@ -102,10 +102,63 @@ def init_db():
 #  Auth helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _require_admin(data):
-    if data.get('secret') != ADMIN_SECRET:
-        return jsonify({'error': 'Forbidden'}), 403
-    return None
+def _require_admin(data=None):
+    """
+    Accept secret from query string, JSON body, or form.
+    """
+    candidates = []
+    if data is not None:
+        try:
+            candidates.append(data.get('secret'))
+        except Exception:
+            pass
+    candidates.append(request.args.get('secret'))
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        candidates.append(body.get('secret'))
+    except Exception:
+        pass
+    try:
+        candidates.append(request.form.get('secret'))
+    except Exception:
+        pass
+    for s in candidates:
+        if s and s == ADMIN_SECRET:
+            return None
+    return jsonify({'error': 'Forbidden'}), 403
+
+
+def _row_to_submission(r):
+    return {
+        'id': r['id'],
+        'deviceId': r['device_id'] or '',
+        'device_id': r['device_id'] or '',
+        'name': r['name'] or '',
+        'phone': r['phone'] or '',
+        'utr': r['utr'] or '',
+        'utrId': r['utr'] or '',
+        'status': r['status'] or 'pending',
+        'createdAt': r['created_at'] or '',
+        'created_at': r['created_at'] or '',
+        'amount': 999,
+    }
+
+
+def _row_to_purchase(r):
+    return {
+        'id': r['id'],
+        'deviceId': r['device_id'] or '',
+        'device_id': r['device_id'] or '',
+        'clientName': r['client_name'] or '',
+        'name': r['client_name'] or '',
+        'templates': r['templates'] or '',
+        'amount': r['amount'] or 0,
+        'utr': r['utr'] or '',
+        'utrId': r['utr'] or '',
+        'status': r['status'] or 'pending',
+        'createdAt': r['created_at'] or '',
+        'created_at': r['created_at'] or '',
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,46 +354,73 @@ def download_template(tmpl_path):
 
 @app.route('/api/admin/submissions')
 def admin_submissions():
-    data = request.args
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
+    status_filter = request.args.get('status', '').strip().lower()
     db   = get_db()
-    rows = db.execute(
-        'SELECT id, device_id, name, phone, utr, status, created_at '
-        'FROM activations ORDER BY created_at DESC'
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    if status_filter and status_filter != 'all':
+        rows = db.execute(
+            'SELECT id, device_id, name, phone, utr, status, created_at '
+            'FROM activations WHERE status = ? ORDER BY created_at DESC',
+            (status_filter,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            'SELECT id, device_id, name, phone, utr, status, created_at '
+            'FROM activations ORDER BY created_at DESC'
+        ).fetchall()
+    items = [_row_to_submission(r) for r in rows]
+    # Master expects {"submissions": [...]}, keep raw list as fallback under a key.
+    return jsonify({'submissions': items, 'count': len(items)})
+
+
+def _set_submission_status(sub_id, new_status):
+    db = get_db()
+    db.execute('UPDATE activations SET status = ? WHERE id = ?', (new_status, sub_id))
+    db.commit()
+    return jsonify({'ok': True, 'id': sub_id, 'status': new_status})
 
 
 @app.route('/api/admin/approve', methods=['POST'])
 def admin_approve():
-    data = request.get_json(force=True, silent=True) or {}
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
-    sub_id = data.get('id')
+    data = request.get_json(force=True, silent=True) or {}
+    sub_id = data.get('id') or request.args.get('id')
     if not sub_id:
         return jsonify({'error': 'id required'}), 400
-    db = get_db()
-    db.execute("UPDATE activations SET status = 'approved' WHERE id = ?", (sub_id,))
-    db.commit()
-    return jsonify({'ok': True})
+    return _set_submission_status(sub_id, 'approved')
 
 
 @app.route('/api/admin/reject', methods=['POST'])
 def admin_reject():
-    data = request.get_json(force=True, silent=True) or {}
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
-    sub_id = data.get('id')
+    data = request.get_json(force=True, silent=True) or {}
+    sub_id = data.get('id') or request.args.get('id')
     if not sub_id:
         return jsonify({'error': 'id required'}), 400
-    db = get_db()
-    db.execute("UPDATE activations SET status = 'rejected' WHERE id = ?", (sub_id,))
-    db.commit()
-    return jsonify({'ok': True})
+    return _set_submission_status(sub_id, 'rejected')
+
+
+# ── Aliases used by master: /api/admin/submissions/<id>/approve|reject
+@app.route('/api/admin/submissions/<int:sub_id>/approve', methods=['POST'])
+def admin_submissions_approve(sub_id):
+    err = _require_admin()
+    if err:
+        return err
+    return _set_submission_status(sub_id, 'approved')
+
+
+@app.route('/api/admin/submissions/<int:sub_id>/reject', methods=['POST'])
+def admin_submissions_reject(sub_id):
+    err = _require_admin()
+    if err:
+        return err
+    return _set_submission_status(sub_id, 'rejected')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,46 +429,71 @@ def admin_reject():
 
 @app.route('/api/admin/purchases')
 def admin_purchases():
-    data = request.args
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
+    status_filter = request.args.get('status', '').strip().lower()
     db   = get_db()
-    rows = db.execute(
-        'SELECT id, device_id, client_name, templates, amount, utr, status, created_at '
-        'FROM purchases ORDER BY created_at DESC'
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    if status_filter and status_filter != 'all':
+        rows = db.execute(
+            'SELECT id, device_id, client_name, templates, amount, utr, status, created_at '
+            'FROM purchases WHERE status = ? ORDER BY created_at DESC',
+            (status_filter,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            'SELECT id, device_id, client_name, templates, amount, utr, status, created_at '
+            'FROM purchases ORDER BY created_at DESC'
+        ).fetchall()
+    items = [_row_to_purchase(r) for r in rows]
+    return jsonify({'purchases': items, 'count': len(items)})
+
+
+def _set_purchase_status(pid, new_status):
+    db = get_db()
+    db.execute('UPDATE purchases SET status = ? WHERE id = ?', (new_status, pid))
+    db.commit()
+    return jsonify({'ok': True, 'id': pid, 'status': new_status})
 
 
 @app.route('/api/admin/approve-purchase', methods=['POST'])
 def admin_approve_purchase():
-    data = request.get_json(force=True, silent=True) or {}
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
-    pid = data.get('id')
+    data = request.get_json(force=True, silent=True) or {}
+    pid = data.get('id') or request.args.get('id')
     if not pid:
         return jsonify({'error': 'id required'}), 400
-    db = get_db()
-    db.execute("UPDATE purchases SET status = 'approved' WHERE id = ?", (pid,))
-    db.commit()
-    return jsonify({'ok': True})
+    return _set_purchase_status(pid, 'approved')
+
+
+@app.route('/api/admin/purchases/<int:pid>/approve', methods=['POST'])
+def admin_purchases_approve(pid):
+    err = _require_admin()
+    if err:
+        return err
+    return _set_purchase_status(pid, 'approved')
+
+
+@app.route('/api/admin/purchases/<int:pid>/reject', methods=['POST'])
+def admin_purchases_reject(pid):
+    err = _require_admin()
+    if err:
+        return err
+    return _set_purchase_status(pid, 'rejected')
 
 
 @app.route('/api/admin/reject-purchase', methods=['POST'])
 def admin_reject_purchase():
-    data = request.get_json(force=True, silent=True) or {}
-    err  = _require_admin(data)
+    err = _require_admin()
     if err:
         return err
-    pid = data.get('id')
+    data = request.get_json(force=True, silent=True) or {}
+    pid = data.get('id') or request.args.get('id')
     if not pid:
         return jsonify({'error': 'id required'}), 400
-    db = get_db()
-    db.execute("UPDATE purchases SET status = 'rejected' WHERE id = ?", (pid,))
-    db.commit()
-    return jsonify({'ok': True})
+    return _set_purchase_status(pid, 'rejected')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
