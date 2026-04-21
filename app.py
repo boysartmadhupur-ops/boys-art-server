@@ -121,55 +121,129 @@ def health():
 #  Activation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _lookup_activation(db, device_id='', phone=''):
+    """
+    Lookup an activation row by device_id (preferred) or phone.
+    Returns the row or None.
+    """
+    if device_id:
+        row = db.execute(
+            'SELECT id, device_id, name, phone, utr, status, created_at '
+            'FROM activations WHERE device_id = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (device_id,)
+        ).fetchone()
+        if row:
+            return row
+    if phone:
+        row = db.execute(
+            'SELECT id, device_id, name, phone, utr, status, created_at '
+            'FROM activations WHERE phone = ? '
+            'ORDER BY (status="approved") DESC, id DESC LIMIT 1',
+            (phone,)
+        ).fetchone()
+        if row:
+            return row
+    return None
+
+
 @app.route('/api/activate', methods=['POST'])
 def activate():
     data = request.get_json(force=True, silent=True) or {}
-    device_id = data.get('device_id', '').strip()
-    if not device_id:
-        return jsonify({'error': 'device_id required'}), 400
+    device_id = (data.get('device_id') or data.get('deviceId') or '').strip()
+    phone     = (data.get('phone') or '').strip()
+    name      = (data.get('name')  or '').strip()
+    utr       = (data.get('utr') or data.get('utrId') or '').strip()
+
+    if not device_id and not phone:
+        return jsonify({'ok': False, 'error': 'device_id required'}), 400
 
     db = get_db()
-    existing = db.execute(
-        'SELECT status FROM activations WHERE device_id = ?', (device_id,)
-    ).fetchone()
+    existing = _lookup_activation(db, device_id, phone)
 
     if existing:
         status = existing['status']
         if status == 'approved':
-            return jsonify({'ok': True, 'status': 'approved'})
-        elif status == 'pending':
-            return jsonify({'ok': True, 'status': 'pending',
-                            'message': 'Your activation is under review.'})
-        else:
-            return jsonify({'ok': True, 'status': 'rejected',
-                            'message': 'Activation rejected. Contact support.'})
+            # Recognised device / phone — no payment needed.
+            return jsonify({
+                'ok': True, 'status': 'approved',
+                'name': existing['name'] or name,
+                'id': existing['id'],
+            })
+        if status == 'pending':
+            # If the same device re-submits, just acknowledge.
+            if device_id and existing['device_id'] == device_id:
+                return jsonify({
+                    'ok': True, 'status': 'pending',
+                    'id': existing['id'],
+                    'message': 'Awaiting approval.',
+                })
+        # rejected, or a different device on same phone -> fall through to insert
 
     db.execute(
         'INSERT INTO activations (device_id, name, phone, utr) VALUES (?, ?, ?, ?)',
-        (device_id,
-         data.get('name', ''),
-         data.get('phone', ''),
-         data.get('utr', ''))
+        (device_id, name, phone, utr)
     )
     db.commit()
-    return jsonify({'ok': True, 'status': 'pending',
-                    'message': 'Activation request submitted. Awaiting approval.'})
+    new_id = db.execute('SELECT last_insert_rowid() AS i').fetchone()['i']
+    return jsonify({
+        'ok': True, 'status': 'pending', 'id': new_id,
+        'message': 'Activation request submitted. Awaiting approval.'
+    })
+
+
+# ── Alias used by client: POST /api/activation/submit ──────────────
+@app.route('/api/activation/submit', methods=['POST'])
+def activation_submit():
+    return activate()
 
 
 @app.route('/api/activation/status')
 def activation_status():
     device_id = request.args.get('device_id', '').strip()
-    if not device_id:
-        return jsonify({'error': 'device_id required'}), 400
-
+    phone     = request.args.get('phone', '').strip()
     db = get_db()
-    row = db.execute(
-        'SELECT status FROM activations WHERE device_id = ?', (device_id,)
-    ).fetchone()
-
+    row = _lookup_activation(db, device_id, phone)
     if not row:
         return jsonify({'status': 'not_found'})
-    return jsonify({'status': row['status']})
+    return jsonify({
+        'status': row['status'],
+        'name': row['name'] or '',
+        'id': row['id'],
+    })
+
+
+# ── Alias used by client: GET /api/activation/status/<phone> ───────
+@app.route('/api/activation/status/<path:phone>')
+def activation_status_by_phone(phone):
+    device_id = request.args.get('device_id', '').strip()
+    db = get_db()
+    row = _lookup_activation(db, device_id, phone.strip())
+    if not row:
+        return jsonify({'status': 'not_found'})
+    return jsonify({
+        'status': row['status'],
+        'name': row['name'] or '',
+        'id': row['id'],
+    })
+
+
+# ── Server-side device memory check ────────────────────────────────
+@app.route('/api/activation/check-device')
+def activation_check_device():
+    device_id = request.args.get('device_id', '').strip()
+    if not device_id:
+        return jsonify({'status': 'not_found'})
+    db = get_db()
+    row = _lookup_activation(db, device_id, '')
+    if not row:
+        return jsonify({'status': 'not_found'})
+    return jsonify({
+        'status': row['status'],
+        'name': row['name'] or '',
+        'phone': row['phone'] or '',
+        'id': row['id'],
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
